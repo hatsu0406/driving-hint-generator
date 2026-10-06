@@ -4,3 +4,5 @@ faiss-cpu
 pandas
 google-genai
 openpyxl
+gspread
+google-auth
