@@ -132,33 +132,6 @@ def detect_bias_type_rule_based(question_text: str):
     return None
 
 
-def detect_bias_type_ai(question_text: str):
-    prompt = f"""以下は運転免許学科試験の問題文です。
-この問題が誤答を生みやすい心理学的な理由を、次の3タイプのいずれかに分類してください。
-
-①ヒューリスティック型：関連する知識・スキーマが先に発動し、例外条件を読み飛ばして即座に判断してしまうパターン
-③処理流暢性型：文章が自然で読みやすいほど「正しい」と感じられやすいパターン
-④論理構造負荷型：二重否定や複数条件の併記など、文の論理構造自体が複雑で誤読を生むパターン
-
-【問題文】{question_text}
-
-出力は番号(1, 3, 4のいずれか)のみを返してください。
-"""
-    response = client.models.generate_content(
-        model=GEMINI_MODEL_NAME,
-        contents=prompt,
-    )
-    match = re.search(r"[134]", response.text)
-    return int(match.group()) if match else 1
-
-
-def detect_bias_type(question_text: str):
-    rule_result = detect_bias_type_rule_based(question_text)
-    if rule_result is not None:
-        return rule_result
-    return detect_bias_type_ai(question_text)
-
-
 # ------------------------------------------------------------
 # ④ 候補シートへの自動記録
 # ------------------------------------------------------------
@@ -189,6 +162,7 @@ BIAS_GUIDANCE = {
 
 
 def build_prompt(question: str, context: str, bias_type: int) -> str:
+    """バイアスタイプがルールベースで既に確定している場合に使う、ヒント生成専用プロンプト。"""
     guidance = BIAS_GUIDANCE.get(bias_type, "")
     return f"""あなたは運転免許試験の学習をサポートする先生です。
 以下の問題について、参考資料を読んで内容を理解したうえで、
@@ -212,14 +186,55 @@ def build_prompt(question: str, context: str, bias_type: int) -> str:
 """
 
 
+def build_prompt_with_bias_detection(question: str, context: str) -> str:
+    """
+    バイアスタイプがルールベースで判定できなかった場合に使う、
+    「バイアス判定」と「ヒント生成」を1回のAPI呼び出しにまとめたプロンプト。
+    """
+    return f"""あなたは運転免許試験の学習をサポートする先生であり、認知バイアスの研究者でもあります。
+以下の問題文について、2つのことを行ってください。
+
+【作業1】この問題が誤答を生みやすい心理学的な理由を、次の3タイプのいずれかに分類してください。
+①ヒューリスティック型：関連する知識・スキーマが先に発動し、例外条件を読み飛ばして即座に判断してしまうパターン
+③処理流暢性型：文章が自然で読みやすいほど「正しい」と感じられやすいパターン
+④論理構造負荷型：二重否定や複数条件の併記など、文の論理構造自体が複雑で誤読を生むパターン
+
+【作業2】分類結果を踏まえて、「正しい」か「誤り」かを直接明言せず、受験者自身が考えられるようなヒントを作成してください。
+
+【厳守事項（ヒント作成時）】
+- 「正しい」「誤り」という言葉、またはそれを直接示唆する断定的な表現は使わない
+- 参考資料の文章をそのまま引用・言い換えコピーしない
+- 問題文のどの言葉・どの条件に注目すべきかを示す
+- 関連する交通ルールの考え方を、答えを教えない範囲で示す
+
+【問題文】{question}
+
+【参考資料(ヒント作成の参考にするだけで、そのまま出力しないこと)】
+{context}
+
+【出力形式(この形式を厳守し、他の文章は含めないこと)】
+バイアスタイプ: (1, 3, 4のいずれか1つの数字のみ)
+ヒント: (100文字程度、です・ます調)
+"""
+
+
 # ------------------------------------------------------------
 # ⑥ 生成（Generation）メインパイプライン
 # ------------------------------------------------------------
+def parse_combined_response(raw_text: str):
+    """バイアスタイプ＋ヒントを同時に返したレスポンスをパースする。"""
+    bias_match = re.search(r"バイアスタイプ[：:]\s*([134])", raw_text)
+    bias_type = int(bias_match.group(1)) if bias_match else 1
+
+    hint_match = re.search(r"ヒント[：:]\s*(.+)", raw_text, re.DOTALL)
+    hint_text = hint_match.group(1).strip() if hint_match else raw_text.strip()
+
+    return bias_type, hint_text
+
+
 def generate_explanation(question: str):
     keyword_df = load_keyword_table()
     matched_row = keyword_match(question, keyword_df)
-
-    bias_type = detect_bias_type(question)
 
     if matched_row is not None:
         # キーワード一致 → 本体シートの知識を使う
@@ -233,15 +248,32 @@ def generate_explanation(question: str):
             for _, row in retrieved_rows.iterrows()
         )
         source_info = "RAGフォールバック（キーワード未一致）"
-        # 未知の問題として候補シートに自動記録
+
+    rule_result = detect_bias_type_rule_based(question)
+
+    if rule_result is not None:
+        # ⑤絶対表現・②アンカリングはルールで確定 → API呼び出しは1回（ヒント生成のみ）
+        bias_type = rule_result
+        prompt = build_prompt(question, context, bias_type)
+        response = client.models.generate_content(
+            model=GEMINI_MODEL_NAME,
+            contents=prompt,
+        )
+        hint_text = response.text
+    else:
+        # ①③④はAPI1回で「判定」と「ヒント生成」を同時に行う
+        prompt = build_prompt_with_bias_detection(question, context)
+        response = client.models.generate_content(
+            model=GEMINI_MODEL_NAME,
+            contents=prompt,
+        )
+        bias_type, hint_text = parse_combined_response(response.text)
+
+    if matched_row is None:
+        # 未知の問題として候補シートに自動記録（API呼び出し後、判定結果が出てから記録）
         append_candidate(question, context, bias_type)
 
-    prompt = build_prompt(question, context, bias_type)
-    response = client.models.generate_content(
-        model=GEMINI_MODEL_NAME,
-        contents=prompt,
-    )
-    return response.text, source_info, BIAS_TYPES.get(bias_type, "")
+    return hint_text, source_info, BIAS_TYPES.get(bias_type, "")
 
 
 # ------------------------------------------------------------
