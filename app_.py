@@ -4,7 +4,8 @@
 
 事前に必要なもの：
     - kaisetsu_index.faiss / kaisetsu_df.pkl（RAGフォールバック用、build_knowledge_base.pyで作成）
-    - Googleスプレッドシート（シート「本体」「候補」の2枚構成）
+    - Googleスプレッドシート（シート「本体」「候補」の2枚構成。候補シートの列は
+      問題文 / RAGの参考情報 / 情報源URL(Grounding) / 推定バイアスタイプ / キーワード候補 / ステータス / 日時）
     - サービスアカウントのJSONキー
 
 .streamlit/secrets.toml に以下を設定する：
@@ -38,6 +39,7 @@ from sentence_transformers import SentenceTransformer
 from google import genai
 import gspread
 from google.oauth2.service_account import Credentials
+from google.genai import types
 
 # ------------------------------------------------------------
 # 初期設定
@@ -135,12 +137,15 @@ def detect_bias_type_rule_based(question_text: str):
 # ------------------------------------------------------------
 # ④ 候補シートへの自動記録
 # ------------------------------------------------------------
-def append_candidate(question_text: str, rag_context: str, bias_type: int):
+def append_candidate(question_text: str, rag_context: str, bias_type: int,
+                      sources: str, keyword_suggestion: str):
     try:
         sheet_candidate.append_row([
             question_text,
             rag_context,
+            sources,
             BIAS_TYPES.get(bias_type, ""),
+            keyword_suggestion,
             "未確認",
             datetime.datetime.now().strftime("%Y-%m-%d %H:%M"),
         ])
@@ -161,16 +166,28 @@ BIAS_GUIDANCE = {
 }
 
 
-def build_prompt(question: str, context: str, bias_type: int) -> str:
-    """バイアスタイプがルールベースで既に確定している場合に使う、ヒント生成専用プロンプト。"""
+def build_prompt(question: str, context: str, bias_type: int,
+                  need_keyword: bool = False) -> str:
+    """バイアスタイプが既に確定している場合に使うプロンプト（キーワード一致時 or ルールベース確定時）。"""
     guidance = BIAS_GUIDANCE.get(bias_type, "")
+
+    keyword_instruction = ""
+    keyword_format = ""
+    if need_keyword:
+        keyword_instruction = (
+            "\n【作業2】この問題文の中心となる交通ルールの概念を表す、"
+            "短い単語（1〜2語、例:「踏切」「駐車禁止」）をキーワードとして抽出してください。"
+        )
+        keyword_format = "\nキーワード候補: (1〜2語の単語のみ)"
+
     return f"""あなたは運転免許試験の学習をサポートする先生です。
 以下の問題について、参考資料を読んで内容を理解したうえで、
 「正しい」か「誤り」かを直接明言せずに、受験者自身が考えられるようなヒントを作成してください。
+{keyword_instruction}
 
 【この問題の誤答傾向】{guidance}
 
-【厳守事項】
+【厳守事項（ヒント作成時）】
 - 「正しい」「誤り」という言葉、またはそれを直接示唆する断定的な表現は使わない
 - 参考資料の文章をそのまま引用・言い換えコピーしない
 - 問題文のどの言葉・どの条件に注目すべきかを示す
@@ -181,18 +198,28 @@ def build_prompt(question: str, context: str, bias_type: int) -> str:
 【参考資料(ヒント作成の参考にするだけで、そのまま出力しないこと)】
 {context}
 
-【出力形式】
-ヒント: (100文字程度、です・ます調)
+【出力形式(この形式を厳守し、他の文章は含めないこと)】
+ヒント: (100文字程度、です・ます調){keyword_format}
 """
 
 
-def build_prompt_with_bias_detection(question: str, context: str) -> str:
+def build_prompt_with_bias_detection(question: str, context: str,
+                                      need_keyword: bool = False) -> str:
     """
     バイアスタイプがルールベースで判定できなかった場合に使う、
-    「バイアス判定」と「ヒント生成」を1回のAPI呼び出しにまとめたプロンプト。
+    「バイアス判定」「ヒント生成」「(必要なら)キーワード抽出」を1回のAPI呼び出しにまとめたプロンプト。
     """
+    keyword_instruction = ""
+    keyword_format = ""
+    if need_keyword:
+        keyword_instruction = (
+            "\n【作業3】この問題文の中心となる交通ルールの概念を表す、"
+            "短い単語（1〜2語、例:「踏切」「駐車禁止」）をキーワードとして抽出してください。"
+        )
+        keyword_format = "\nキーワード候補: (1〜2語の単語のみ)"
+
     return f"""あなたは運転免許試験の学習をサポートする先生であり、認知バイアスの研究者でもあります。
-以下の問題文について、2つのことを行ってください。
+以下の問題文について、次の作業を行ってください。
 
 【作業1】この問題が誤答を生みやすい心理学的な理由を、次の3タイプのいずれかに分類してください。
 ①ヒューリスティック型：関連する知識・スキーマが先に発動し、例外条件を読み飛ばして即座に判断してしまうパターン
@@ -200,6 +227,7 @@ def build_prompt_with_bias_detection(question: str, context: str) -> str:
 ④論理構造負荷型：二重否定や複数条件の併記など、文の論理構造自体が複雑で誤読を生むパターン
 
 【作業2】分類結果を踏まえて、「正しい」か「誤り」かを直接明言せず、受験者自身が考えられるようなヒントを作成してください。
+{keyword_instruction}
 
 【厳守事項（ヒント作成時）】
 - 「正しい」「誤り」という言葉、またはそれを直接示唆する断定的な表現は使わない
@@ -214,64 +242,108 @@ def build_prompt_with_bias_detection(question: str, context: str) -> str:
 
 【出力形式(この形式を厳守し、他の文章は含めないこと)】
 バイアスタイプ: (1, 3, 4のいずれか1つの数字のみ)
-ヒント: (100文字程度、です・ます調)
+ヒント: (100文字程度、です・ます調){keyword_format}
 """
 
 
 # ------------------------------------------------------------
 # ⑥ 生成（Generation）メインパイプライン
 # ------------------------------------------------------------
-def parse_combined_response(raw_text: str):
-    """バイアスタイプ＋ヒントを同時に返したレスポンスをパースする。"""
-    bias_match = re.search(r"バイアスタイプ[：:]\s*([134])", raw_text)
-    bias_type = int(bias_match.group(1)) if bias_match else 1
+def parse_combined_response(raw_text: str, has_bias: bool, has_keyword: bool):
+    """バイアスタイプ／ヒント／キーワード候補を同時に返したレスポンスをパースする。"""
+    bias_type = None
+    if has_bias:
+        bias_match = re.search(r"バイアスタイプ[：:]\s*([134])", raw_text)
+        bias_type = int(bias_match.group(1)) if bias_match else 1
 
-    hint_match = re.search(r"ヒント[：:]\s*(.+)", raw_text, re.DOTALL)
+    keyword_suggestion = ""
+    if has_keyword:
+        kw_match = re.search(r"キーワード候補[：:]\s*(.+)", raw_text)
+        keyword_suggestion = kw_match.group(1).strip() if kw_match else ""
+
+    # ヒント部分は「ヒント:」の次の行から「キーワード候補:」の手前まで
+    hint_match = re.search(r"ヒント[：:]\s*(.+?)(?=\nキーワード候補|\Z)", raw_text, re.DOTALL)
     hint_text = hint_match.group(1).strip() if hint_match else raw_text.strip()
 
-    return bias_type, hint_text
+    return bias_type, hint_text, keyword_suggestion
+
+
+def grounded_search(question_text: str):
+    """Google検索によるGroundingを使って、問題文に関する裏付け情報を取得する。"""
+    grounding_tool = types.Tool(google_search=types.GoogleSearch())
+    config = types.GenerateContentConfig(tools=[grounding_tool])
+
+    response = client.models.generate_content(
+        model=GEMINI_MODEL_NAME,
+        contents=f"運転免許学科試験に関連する次の問題文について、正確な交通ルールの根拠を日本語で簡潔に説明してください。\n\n【問題文】{question_text}",
+        config=config,
+    )
+
+    grounded_text = response.text
+    sources = []
+    try:
+        chunks = response.candidates[0].grounding_metadata.grounding_chunks
+        for chunk in chunks:
+            if chunk.web and chunk.web.uri:
+                sources.append(chunk.web.uri)
+    except (AttributeError, IndexError, TypeError):
+        pass
+
+    return grounded_text, sources
 
 
 def generate_explanation(question: str):
     keyword_df = load_keyword_table()
     matched_row = keyword_match(question, keyword_df)
 
+    sources_text = ""
+
     if matched_row is not None:
         # キーワード一致 → 本体シートの知識を使う
         context = matched_row.get("supplement", "")
         source_info = f"キーワード一致: {matched_row.get('keyword1', '')}"
     else:
-        # 未一致 → RAGフォールバック
+        # 未一致 → RAG（参考情報）＋ Grounding（根拠付き情報）の両方を使う
         retrieved_rows = rag_search(question, top_k=3)
-        context = "\n".join(
+        rag_context = "\n".join(
             f"- 類似問題:{row['問題文']} / 解答:{row['解答']} / 解説:{row['解説']}"
             for _, row in retrieved_rows.iterrows()
         )
-        source_info = "RAGフォールバック（キーワード未一致）"
+
+        grounded_text, sources = grounded_search(question)
+        sources_text = "\n".join(sources) if sources else "(情報源なし)"
+
+        context = f"【Google検索による裏付け情報】\n{grounded_text}\n\n【参考: 類似問題】\n{rag_context}"
+        source_info = "RAG＋Groundingフォールバック（キーワード未一致）"
 
     rule_result = detect_bias_type_rule_based(question)
+    need_keyword = matched_row is None  # 未知の問題の時だけキーワード候補を提案させる
 
     if rule_result is not None:
-        # ⑤絶対表現・②アンカリングはルールで確定 → API呼び出しは1回（ヒント生成のみ）
+        # ⑤絶対表現・②アンカリングはルールで確定 → API呼び出しは1回
         bias_type = rule_result
-        prompt = build_prompt(question, context, bias_type)
+        prompt = build_prompt(question, context, bias_type, need_keyword=need_keyword)
         response = client.models.generate_content(
             model=GEMINI_MODEL_NAME,
             contents=prompt,
         )
-        hint_text = response.text
+        _, hint_text, keyword_suggestion = parse_combined_response(
+            response.text, has_bias=False, has_keyword=need_keyword
+        )
     else:
-        # ①③④はAPI1回で「判定」と「ヒント生成」を同時に行う
-        prompt = build_prompt_with_bias_detection(question, context)
+        # ①③④はAPI1回で「判定」「ヒント生成」「(必要なら)キーワード抽出」を同時に行う
+        prompt = build_prompt_with_bias_detection(question, context, need_keyword=need_keyword)
         response = client.models.generate_content(
             model=GEMINI_MODEL_NAME,
             contents=prompt,
         )
-        bias_type, hint_text = parse_combined_response(response.text)
+        bias_type, hint_text, keyword_suggestion = parse_combined_response(
+            response.text, has_bias=True, has_keyword=need_keyword
+        )
 
     if matched_row is None:
-        # 未知の問題として候補シートに自動記録（API呼び出し後、判定結果が出てから記録）
-        append_candidate(question, context, bias_type)
+        # 未知の問題として候補シートに自動記録
+        append_candidate(question, context, bias_type, sources_text, keyword_suggestion)
 
     return hint_text, source_info, BIAS_TYPES.get(bias_type, "")
 
@@ -331,7 +403,16 @@ with tab_admin:
             with st.container(border=True):
                 st.write(f"**問題文**: {row['問題文']}")
                 st.write(f"**RAGの参考情報**: {row['RAGの参考情報']}")
+                st.write(f"**情報源URL(Grounding)**: {row.get('情報源URL(Grounding)', '')}")
                 st.write(f"**推定バイアスタイプ**: {row['推定バイアスタイプ']}")
+
+                # AIが提案したキーワード候補を初期値にしつつ、手動で修正可能にする
+                suggested_keyword = row.get("キーワード候補", "")
+                final_keyword = st.text_input(
+                    "本体に登録するキーワード（AIの提案を修正できます）",
+                    value=suggested_keyword,
+                    key=f"keyword_{idx}",
+                )
 
                 col1, col2 = st.columns(2)
 
@@ -340,17 +421,16 @@ with tab_admin:
 
                 with col1:
                     if st.button("承認して本体に追加", key=f"approve_{idx}"):
-                        # 本体シートに追加（キーワードは問題文の先頭部分を仮に使用、要手動調整）
                         sheet_main.append_row([
-                            row["問題文"][:15],  # 仮のキーワード（後で手動修正推奨）
+                            final_keyword,
                             "",
                             row["RAGの参考情報"],
                         ])
-                        sheet_candidate.update_cell(sheet_row_num, 4, "承認済み")
+                        sheet_candidate.update_cell(sheet_row_num, 6, "承認済み")
                         st.cache_data.clear()
                         st.rerun()
 
                 with col2:
                     if st.button("却下", key=f"reject_{idx}"):
-                        sheet_candidate.update_cell(sheet_row_num, 4, "却下")
+                        sheet_candidate.update_cell(sheet_row_num, 6, "却下")
                         st.rerun()
